@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -454,7 +456,9 @@ func TestGetReplayAbsolutizesRelativeURLs(t *testing.T) {
 			"started_at_ms": 1000, "ended_at_ms": 2000, "end_reason": "api",
 			"video": {"url": "/sessions/3f9c62d81b4a/replay/files/video.webm?token=r",
 			          "format": "webm", "codec": "vp8",
-			          "start_time_ms": 1000, "duration_ms": 1000, "size_bytes": 42},
+			          "start_time_ms": 1000, "duration_ms": 1000, "size_bytes": 42,
+			          "segments": [{"start_ms": 1000, "offset_ms": 0, "duration_ms": 400},
+			                       {"start_ms": 1600, "offset_ms": 400, "duration_ms": 600}]},
 			"page_count": 1,
 			"pages": [{"page_id": "p_000", "url": "https://example.com",
 			           "start_time_ms": 1000, "end_time_ms": 2000}],
@@ -482,6 +486,12 @@ func TestGetReplayAbsolutizesRelativeURLs(t *testing.T) {
 	}
 	if replay.Pages[0].PageID != "p_000" {
 		t.Errorf("PageID = %q", replay.Pages[0].PageID)
+	}
+	if len(replay.Video.Segments) != 2 {
+		t.Fatalf("len(Segments) = %d, want 2", len(replay.Video.Segments))
+	}
+	if got := replay.Video.Segments[1]; got.StartMs != 1600 || got.OffsetMs != 400 || got.DurationMs != 600 {
+		t.Errorf("Segments[1] = %+v", got)
 	}
 }
 
@@ -513,6 +523,73 @@ func TestWaitForReplayPollsThroughRecordingAnd404(t *testing.T) {
 	}
 }
 
+func TestWaitForReplayFastFailsWhenNotRecorded(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"detail": "session is not being recorded"}`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("k", server.URL)
+	_, err := client.WaitForReplay(context.Background(), "x", time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "record: true") {
+		t.Fatalf("err = %v, want record: true hint", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("want wrapped 404 APIError, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (no polling)", calls)
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestWaitForReplayDefaultDeadlineWhenContextHasNone(t *testing.T) {
+	// A context without a deadline must not poll forever: WaitForReplay wraps
+	// it with DefaultReplayWait. Observe the deadline from inside the request.
+	var deadline time.Time
+	var hasDeadline bool
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, hasDeadline = r.Context().Deadline()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"status": "ready", "session_id": "x"}`)),
+		}, nil
+	})}
+	client, err := NewWithOptions("k", WithBaseURL("http://fake.invalid"), WithHTTPClient(hc))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.WaitForReplay(context.Background(), "x", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if !hasDeadline {
+		t.Fatal("request context has no deadline; want DefaultReplayWait applied")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > DefaultReplayWait {
+		t.Errorf("deadline %v from now, want within DefaultReplayWait", remaining)
+	}
+
+	// A caller-supplied deadline is respected, not replaced.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if _, err := client.WaitForReplay(ctx, "x", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if remaining := time.Until(deadline); remaining <= DefaultReplayWait {
+		t.Errorf("caller deadline overridden: %v remaining, want ~10m", remaining)
+	}
+}
+
 func TestWaitForReplayPropagatesOtherErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -524,6 +601,240 @@ func TestWaitForReplayPropagatesOtherErrors(t *testing.T) {
 	_, err := client.WaitForReplay(context.Background(), "x", time.Millisecond)
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCreateSessionSendsP2Knobs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		for key, want := range map[string]any{
+			"start_url":            "about:blank",
+			"stealth":              true,
+			"downloads":            true,
+			"user_agent":           "UA/1.0",
+			"locale":               "en-GB",
+			"timezone":             "America/New_York",
+			"context_id":           "login-1",
+			"solve_captchas":       true,
+			"max_lifetime_seconds": float64(600),
+		} {
+			if body[key] != want {
+				t.Errorf("%s = %v, want %v", key, body[key], want)
+			}
+		}
+		proxy, _ := body["proxy"].(map[string]any)
+		if proxy["server"] != "http://p:8080" || proxy["username"] != "u" {
+			t.Errorf("proxy = %v", body["proxy"])
+		}
+		if _, present := proxy["bypass"]; present {
+			t.Error("empty proxy bypass should be omitted")
+		}
+		geo, _ := body["geolocation"].(map[string]any)
+		if geo["lat"] != 40.7 || geo["lon"] != -74.0 {
+			t.Errorf("geolocation = %v", body["geolocation"])
+		}
+		metadata, _ := body["metadata"].(map[string]any)
+		if metadata["job"] != "x" {
+			t.Errorf("metadata = %v", body["metadata"])
+		}
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(sessionBody))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	_, err := client.CreateSession(context.Background(), CreateSessionOptions{
+		StartURL:           "about:blank",
+		Stealth:            true,
+		Downloads:          true,
+		UserAgent:          "UA/1.0",
+		Locale:             "en-GB",
+		Timezone:           "America/New_York",
+		Geolocation:        &Geolocation{Lat: 40.7, Lon: -74.0},
+		Proxy:              &ProxyConfig{Server: "http://p:8080", Username: "u", Password: "s"},
+		ContextID:          "login-1",
+		SolveCaptchas:      true,
+		Metadata:           map[string]string{"job": "x"},
+		MaxLifetimeSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+}
+
+func TestSessionDecodesConfigAndMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id": "abc", "status": "running", "health": "healthy",
+			"config": {"stealth": true}, "metadata": {"job": "x"}}`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	session, err := client.GetSession(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.Config["stealth"] != true {
+		t.Errorf("Config = %v", session.Config)
+	}
+	if session.Metadata["job"] != "x" {
+		t.Errorf("Metadata = %v", session.Metadata)
+	}
+}
+
+func TestListSessionsByMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("metadata.job"); got != "x" {
+			t.Errorf("metadata.job = %q", got)
+		}
+		w.Write([]byte(`[` + sessionBody + `]`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	sessions, err := client.ListSessionsByMetadata(context.Background(), map[string]string{"job": "x"})
+	if err != nil {
+		t.Fatalf("ListSessionsByMetadata: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(sessions) = %d", len(sessions))
+	}
+}
+
+func TestScreenshotReturnsRawBytes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sessions/abc/screenshot" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("format") != "webp" || r.URL.Query().Get("quality") != "70" {
+			t.Errorf("query = %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "image/webp")
+		w.Write([]byte{1, 2, 3})
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	image, err := client.Screenshot(context.Background(), "abc", ScreenshotOptions{Format: "webp", Quality: 70})
+	if err != nil {
+		t.Fatalf("Screenshot: %v", err)
+	}
+	if string(image) != string([]byte{1, 2, 3}) {
+		t.Errorf("image = %v", image)
+	}
+}
+
+func TestListAndDownloadFiles(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sessions/abc/downloads":
+			w.Write([]byte(`{"session_id": "abc", "files": [{"name": "a.pdf", "size_bytes": 3, "modified_ms": 1}]}`))
+		case "/sessions/abc/downloads/a.pdf":
+			// Presigned-style redirect; the default http.Client follows it.
+			http.Redirect(w, r, "/presigned/a.pdf", http.StatusFound)
+		case "/presigned/a.pdf":
+			w.Write([]byte("pdfbytes"))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	files, err := client.ListDownloads(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("ListDownloads: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "a.pdf" {
+		t.Fatalf("files = %v", files)
+	}
+	data, err := client.DownloadFile(context.Background(), "abc", "a.pdf")
+	if err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	if string(data) != "pdfbytes" {
+		t.Errorf("data = %q", data)
+	}
+}
+
+func TestUploadFileMultipart(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sessions/abc/files" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Fatalf("FormFile: %v", err)
+		}
+		defer file.Close()
+		if header.Filename != "in.csv" {
+			t.Errorf("filename = %q", header.Filename)
+		}
+		data, _ := io.ReadAll(file)
+		if string(data) != "col1,col2" {
+			t.Errorf("content = %q", data)
+		}
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"name": "in.csv", "path": "/downloads/in.csv", "size_bytes": 9}`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	result, err := client.UploadFile(context.Background(), "abc", "in.csv", []byte("col1,col2"))
+	if err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if result.Path != "/downloads/in.csv" {
+		t.Errorf("Path = %q", result.Path)
+	}
+}
+
+func TestSolveCaptcha(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["type"] != CaptchaTurnstile || body["sitekey"] != "0xKEY" {
+			t.Errorf("body = %v", body)
+		}
+		if _, present := body["action"]; present {
+			t.Error("empty action should be omitted")
+		}
+		w.Write([]byte(`{"token": "solved", "type": "turnstile"}`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	token, err := client.SolveCaptcha(context.Background(), "abc", SolveCaptchaOptions{
+		Type: CaptchaTurnstile, Sitekey: "0xKEY", URL: "https://target.example",
+	})
+	if err != nil {
+		t.Fatalf("SolveCaptcha: %v", err)
+	}
+	if token != "solved" {
+		t.Errorf("token = %q", token)
+	}
+}
+
+func TestSolveCaptchaDisabled501(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		w.Write([]byte(`{"detail": "captcha solving is not enabled on this host"}`))
+	}))
+	defer server.Close()
+
+	client := NewWithBaseURL("bv_live_abc", server.URL)
+	_, err := client.SolveCaptcha(context.Background(), "abc", SolveCaptchaOptions{
+		Type: CaptchaTurnstile, Sitekey: "k", URL: "https://x",
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotImplemented {
 		t.Fatalf("err = %v", err)
 	}
 }

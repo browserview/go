@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,7 +27,7 @@ import (
 )
 
 // Version is the version of this SDK.
-const Version = "0.3.1"
+const Version = "0.4.0"
 
 // DefaultBaseURL is the production API origin. It can be overridden with the
 // BROWSERVIEW_BASE_URL environment variable or the WithBaseURL option;
@@ -53,14 +54,17 @@ const (
 // Client defaults, overridable with WithTimeout and WithMaxRetries.
 const (
 	// DefaultTimeout is the default per-request timeout. It is generous
-	// because CreateSession blocks (~5s, sometimes longer) until the
-	// browser is ready unless Wait is set to false.
-	DefaultTimeout = 60 * time.Second
+	// because CreateSession blocks (~5s, sometimes up to ~60s server-side)
+	// until the browser is ready unless Wait is set to false.
+	DefaultTimeout = 90 * time.Second
 	// DefaultMaxRetries is the default number of retries after the initial
 	// attempt.
 	DefaultMaxRetries = 3
 	// maxRetryWait caps a single Retry-After-directed sleep.
 	maxRetryWait = 30 * time.Second
+	// DefaultReplayWait bounds WaitForReplay when the caller's context has
+	// no deadline of its own.
+	DefaultReplayWait = 2 * time.Minute
 )
 
 // Session is a browser session.
@@ -104,7 +108,62 @@ type Session struct {
 	CDPToken string `json:"cdp_token,omitempty"`
 	// TokenTTLSeconds is the lifetime of the embedded tokens, in seconds.
 	TokenTTLSeconds int `json:"token_ttl_seconds,omitempty"`
+	// Config is the applied per-session configuration (proxy/user_agent/
+	// locale/timezone/geolocation/stealth/downloads/context_id/...), echoed
+	// back by the server with proxy credentials redacted. Empty when none
+	// were set.
+	Config map[string]any `json:"config,omitempty"`
+	// Metadata holds the free-form searchable labels attached at create time.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
+
+// ProxyConfig routes a session's egress through a proxy. Credentials are
+// answered over CDP and never reach the browser's command line; they are
+// redacted in API responses.
+type ProxyConfig struct {
+	// Server is "scheme://host:port" — http, https, socks5, or socks4.
+	Server   string `json:"server"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	// Bypass is a comma-separated bypass list, e.g. "*.internal,localhost".
+	Bypass string `json:"bypass,omitempty"`
+}
+
+// Geolocation overrides a session's reported location.
+type Geolocation struct {
+	// Lat is the latitude, -90..90.
+	Lat float64 `json:"lat"`
+	// Lon is the longitude, -180..180.
+	Lon float64 `json:"lon"`
+	// Accuracy is in meters; zero omits the field.
+	Accuracy float64 `json:"accuracy,omitempty"`
+}
+
+// DownloadFile is one file in a downloads-enabled session's /downloads
+// directory.
+type DownloadFile struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
+	// ModifiedMs is the last-modified time, epoch milliseconds.
+	ModifiedMs int64 `json:"modified_ms"`
+}
+
+// UploadResult is returned by UploadFile.
+type UploadResult struct {
+	Name string `json:"name"`
+	// Path is the file's location inside the session container (pass it to
+	// CDP DOM.setFileInputFiles).
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// Captcha challenge types accepted by SolveCaptcha.
+const (
+	CaptchaRecaptchaV2 = "recaptcha_v2"
+	CaptchaRecaptchaV3 = "recaptcha_v3"
+	CaptchaHCaptcha    = "hcaptcha"
+	CaptchaTurnstile   = "turnstile"
+)
 
 // Token is a freshly minted session token.
 type Token struct {
@@ -131,6 +190,55 @@ type CreateSessionOptions struct {
 	// error streams), retrievable with GetReplay after the session ends.
 	// Server default is false.
 	Record bool `json:"record,omitempty"`
+	// MaxLifetimeSeconds auto-destroys the session after this many seconds
+	// (clamped to the plan/global caps). Zero uses the server default.
+	MaxLifetimeSeconds int `json:"max_lifetime_seconds,omitempty"`
+	// Proxy routes the session's egress through a proxy.
+	Proxy *ProxyConfig `json:"proxy,omitempty"`
+	// UserAgent overrides the browser's User-Agent string.
+	UserAgent string `json:"user_agent,omitempty"`
+	// Locale, e.g. "en-US", sets navigator.language and Accept-Language.
+	Locale string `json:"locale,omitempty"`
+	// Timezone is an IANA name, e.g. "America/New_York".
+	Timezone string `json:"timezone,omitempty"`
+	// Geolocation overrides the session's reported location.
+	Geolocation *Geolocation `json:"geolocation,omitempty"`
+	// Stealth enables standard-tier anti-automation-detection tweaks.
+	Stealth bool `json:"stealth,omitempty"`
+	// Downloads mounts a writable, persisted /downloads directory and enables
+	// ListDownloads / DownloadFile / UploadFile for this session.
+	Downloads bool `json:"downloads,omitempty"`
+	// ContextID names an owner-scoped persistent context: cookies from a
+	// previous session with the same id are restored before you start
+	// driving, and archived back on end, so a login carries across runs.
+	ContextID string `json:"context_id,omitempty"`
+	// SolveCaptchas records intent for captcha solving (the SolveCaptcha
+	// endpoint is separately gated on a server-configured provider).
+	SolveCaptchas bool `json:"solve_captchas,omitempty"`
+	// Metadata attaches {key: value} string labels, searchable with
+	// ListSessionsByMetadata.
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// ScreenshotOptions configures Screenshot. The zero value uses the server
+// defaults: PNG at quality 80.
+type ScreenshotOptions struct {
+	// Format is "png", "jpeg", or "webp". Empty uses the server default (png).
+	Format string
+	// Quality is 1-100, for lossy formats. Zero uses the server default (80).
+	Quality int
+}
+
+// SolveCaptchaOptions configures SolveCaptcha.
+type SolveCaptchaOptions struct {
+	// Type is one of the Captcha* constants.
+	Type string `json:"type"`
+	// Sitekey is the site key from the challenge on the page.
+	Sitekey string `json:"sitekey"`
+	// URL is the page URL hosting the challenge.
+	URL string `json:"url"`
+	// Action is the reCAPTCHA v3 action, when applicable.
+	Action string `json:"action,omitempty"`
 }
 
 // Bool returns a pointer to v, for use in CreateSessionOptions.Wait.
@@ -143,6 +251,19 @@ type ReplayPage struct {
 	URL         string `json:"url"`
 	StartTimeMs int64  `json:"start_time_ms"`
 	EndTimeMs   int64  `json:"end_time_ms"`
+}
+
+// ReplaySegment is one raw recording segment inside a replay's merged video.
+// A session normally produces a single segment; an agent restart mid-session
+// produces several, concatenated in order.
+type ReplaySegment struct {
+	// StartMs is when the segment started recording, absolute epoch ms.
+	StartMs int64 `json:"start_ms"`
+	// OffsetMs is where the segment begins within the merged video.
+	OffsetMs int64 `json:"offset_ms"`
+	// DurationMs is the segment's length; it covers
+	// [OffsetMs, OffsetMs+DurationMs) in the merged video.
+	DurationMs int64 `json:"duration_ms"`
 }
 
 // ReplayVideo describes a replay's recorded video: a single seekable WebM.
@@ -158,6 +279,8 @@ type ReplayVideo struct {
 	StartTimeMs int64 `json:"start_time_ms"`
 	DurationMs  int64 `json:"duration_ms"`
 	SizeBytes   int64 `json:"size_bytes"`
+	// Segments maps each raw recording segment into the merged video.
+	Segments []ReplaySegment `json:"segments"`
 }
 
 // ReplayEventStream is one of a replay's event streams (actions, console,
@@ -244,7 +367,7 @@ func WithBaseURL(baseURL string) Option {
 	}
 }
 
-// WithTimeout sets the per-request timeout (default DefaultTimeout, 60s).
+// WithTimeout sets the per-request timeout (default DefaultTimeout, 90s).
 // Zero or negative disables the timeout.
 func WithTimeout(d time.Duration) Option {
 	return func(cfg *clientConfig) error {
@@ -304,7 +427,7 @@ func NewFromEnv(opts ...Option) (*Client, error) {
 
 // NewWithOptions returns a Client configured with functional options. With
 // no options it behaves like New: DefaultBaseURL (or BROWSERVIEW_BASE_URL),
-// a 60s timeout, and 3 retries.
+// a 90s timeout, and 3 retries.
 func NewWithOptions(apiKey string, opts ...Option) (*Client, error) {
 	cfg := clientConfig{
 		baseURL:    DefaultBaseURL,
@@ -393,6 +516,105 @@ func (c *Client) ListSessions(ctx context.Context) ([]Session, error) {
 	return sessions, nil
 }
 
+// ListSessionsByMetadata lists sessions whose metadata labels contain every
+// given {key: value} pair. URL and token fields are omitted; use GetSession
+// for fresh ones.
+func (c *Client) ListSessionsByMetadata(ctx context.Context, metadata map[string]string) ([]Session, error) {
+	path := "/sessions"
+	if len(metadata) > 0 {
+		params := url.Values{}
+		for key, value := range metadata {
+			params.Set("metadata."+key, value)
+		}
+		path += "?" + params.Encode()
+	}
+	var sessions []Session
+	if err := c.do(ctx, http.MethodGet, path, nil, &sessions); err != nil {
+		return nil, err
+	}
+	for i := range sessions {
+		c.resolveURLs(&sessions[i])
+	}
+	return sessions, nil
+}
+
+// Screenshot captures a current-viewport image of a live session and returns
+// the raw image bytes.
+func (c *Client) Screenshot(ctx context.Context, id string, opts ScreenshotOptions) ([]byte, error) {
+	params := url.Values{}
+	if opts.Format != "" {
+		params.Set("format", opts.Format)
+	}
+	if opts.Quality != 0 {
+		params.Set("quality", strconv.Itoa(opts.Quality))
+	}
+	path := "/sessions/" + url.PathEscape(id) + "/screenshot"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	return c.doBytes(ctx, http.MethodGet, path, "", nil, nil, true)
+}
+
+// ListDownloads lists a downloads-enabled session's files (works during and
+// after the session).
+func (c *Client) ListDownloads(ctx context.Context, id string) ([]DownloadFile, error) {
+	var out struct {
+		Files []DownloadFile `json:"files"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/sessions/"+url.PathEscape(id)+"/downloads", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Files, nil
+}
+
+// DownloadFile fetches one downloaded file's contents (following the
+// presigned-S3 redirect the server issues after the session ends).
+func (c *Client) DownloadFile(ctx context.Context, id, name string) ([]byte, error) {
+	path := "/sessions/" + url.PathEscape(id) + "/downloads/" + url.PathEscape(name)
+	return c.doBytes(ctx, http.MethodGet, path, "", nil, nil, true)
+}
+
+// UploadFile places a file into a live session's /downloads mount for
+// input[type=file] flows — attach it via CDP DOM.setFileInputFiles with the
+// returned container Path. The session must have been created with
+// Downloads: true.
+func (c *Client) UploadFile(ctx context.Context, id, filename string, content []byte) (*UploadResult, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, fmt.Errorf("browserview: build upload: %w", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		return nil, fmt.Errorf("browserview: build upload: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("browserview: build upload: %w", err)
+	}
+	var result UploadResult
+	path := "/sessions/" + url.PathEscape(id) + "/files"
+	if _, err := c.doBytes(ctx, http.MethodPost, path, writer.FormDataContentType(), buf.Bytes(), &result, false); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// SolveCaptcha relays a captcha challenge to the server-configured solver
+// and returns the solution token for your agent to inject. The server
+// responds 501 when solving is not enabled on the host.
+func (c *Client) SolveCaptcha(ctx context.Context, id string, opts SolveCaptchaOptions) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/captcha/solve", opts, &out); err != nil {
+		return "", err
+	}
+	if out.Token == "" {
+		return "", errors.New("browserview: unexpected captcha response from the server (missing 'token' field)")
+	}
+	return out.Token, nil
+}
+
 // GetSession fetches a session by id, including fresh URLs and tokens plus
 // the Restarts and Degraded health fields.
 func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
@@ -443,16 +665,24 @@ func (c *Client) GetReplay(ctx context.Context, id string) (*Replay, error) {
 // WaitForReplay polls until a session's replay is ready and returns its
 // manifest, checking every interval until the context is done. It polls
 // through the live ("recording") and finalizing (404) states; any other API
-// error is returned immediately. Pass interval <= 0 for the 5s default.
+// error is returned immediately, as is a 404 reporting that the live session
+// is not being recorded (one created without Record: true). Pass
+// interval <= 0 for the 5s default.
 //
-// Bound the wait with a context deadline, e.g.:
+// When ctx has no deadline the wait is bounded at DefaultReplayWait
+// (2 minutes); a caller-supplied deadline is respected as-is:
 //
-//	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+//	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 //	defer cancel()
 //	replay, err := client.WaitForReplay(ctx, session.ID, 0)
 func (c *Client) WaitForReplay(ctx context.Context, id string, interval time.Duration) (*Replay, error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultReplayWait)
+		defer cancel()
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -465,6 +695,9 @@ func (c *Client) WaitForReplay(ctx context.Context, id string, interval time.Dur
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 				return nil, err
+			}
+			if strings.Contains(apiErr.Message, "not being recorded") {
+				return nil, fmt.Errorf("browserview: session %s was not created with record: true: %w", id, err)
 			}
 		}
 		select {
@@ -496,45 +729,65 @@ func (c *Client) resolveReplayURLs(r *Replay) {
 	}
 }
 
-// do performs one API call with automatic retries. 429 and 503 responses
-// are retried for every method (session creation is not committed on
-// those); transport errors are retried only for idempotent GET/DELETE.
+// do performs one JSON API call with automatic retries. 429 and 503
+// responses are retried for every method (session creation is not committed
+// on those); transport errors are retried only for idempotent GET/DELETE.
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
 	var encoded []byte
+	contentType := ""
 	if in != nil {
 		var err error
 		encoded, err = json.Marshal(in)
 		if err != nil {
 			return fmt.Errorf("browserview: encode request: %w", err)
 		}
+		contentType = "application/json"
 	}
+	_, err := c.doBytes(ctx, method, path, contentType, encoded, out, false)
+	return err
+}
+
+// doBytes is the byte-level core of do: it sends encoded (with contentType,
+// when non-empty) and either decodes the response JSON into out or, when raw
+// is true, returns the response body verbatim (screenshots, file downloads).
+// Retry semantics match do.
+func (c *Client) doBytes(ctx context.Context, method, path, contentType string, encoded []byte, out any, raw bool) ([]byte, error) {
 	idempotent := method == http.MethodGet || method == http.MethodDelete
+
+	// JoinPath escapes a "?" inside its argument, so split any query string
+	// off and re-attach it verbatim.
+	rawQuery := ""
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path, rawQuery = path[:idx], path[idx+1:]
+	}
+	target := c.baseURL.JoinPath(path)
+	target.RawQuery = rawQuery
 
 	for attempt := 0; ; attempt++ {
 		var body io.Reader
 		if encoded != nil {
 			body = bytes.NewReader(encoded)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL.JoinPath(path).String(), body)
+		req, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 		if err != nil {
-			return fmt.Errorf("browserview: build request: %w", err)
+			return nil, fmt.Errorf("browserview: build request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "browserview-go/"+Version)
-		if in != nil {
-			req.Header.Set("Content-Type", "application/json")
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
 		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			if ctx.Err() == nil && idempotent && attempt < c.maxRetries {
 				if serr := c.sleep(ctx, backoff(attempt)); serr != nil {
-					return fmt.Errorf("browserview: retry aborted: %w", serr)
+					return nil, fmt.Errorf("browserview: retry aborted: %w", serr)
 				}
 				continue
 			}
-			return fmt.Errorf("browserview: %s %s: %w", method, path, err)
+			return nil, fmt.Errorf("browserview: %s %s: %w", method, path, err)
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -546,23 +799,31 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 					wait = min(apiErr.RetryAfter, maxRetryWait)
 				}
 				if serr := c.sleep(ctx, wait); serr != nil {
-					return fmt.Errorf("browserview: retry aborted: %w", serr)
+					return nil, fmt.Errorf("browserview: retry aborted: %w", serr)
 				}
 				continue
 			}
-			return apiErr
+			return nil, apiErr
 		}
 
+		if raw {
+			data, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("browserview: read response: %w", err)
+			}
+			return data, nil
+		}
 		if out == nil || resp.StatusCode == http.StatusNoContent {
 			resp.Body.Close()
-			return nil
+			return nil, nil
 		}
 		err = json.NewDecoder(resp.Body).Decode(out)
 		resp.Body.Close()
 		if err != nil {
-			return fmt.Errorf("browserview: decode response: %w", err)
+			return nil, fmt.Errorf("browserview: decode response: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 }
 

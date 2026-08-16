@@ -26,7 +26,7 @@ client, err := browserview.NewFromEnv()
 // With options:
 client, err := browserview.NewWithOptions(apiKey,
 	browserview.WithBaseURL("https://sessions.browserview.io"),
-	browserview.WithTimeout(90*time.Second), // default 60s
+	browserview.WithTimeout(2*time.Minute),  // default 90s
 	browserview.WithMaxRetries(5),           // default 3; 0 disables retries
 )
 ```
@@ -96,6 +96,44 @@ const browser = await chromium.connectOverCDP(session.CDPURL, {
 });
 ```
 
+## Per-session configuration
+
+All create-time knobs live on `CreateSessionOptions`; zero values are omitted:
+
+```go
+session, err := client.CreateSession(ctx, browserview.CreateSessionOptions{
+	StartURL:  "about:blank",
+	Stealth:   true, // anti-automation-detection tweaks
+	UserAgent: "MyAgent/1.0",
+	Locale:    "en-GB",
+	Timezone:  "America/New_York",
+	Geolocation: &browserview.Geolocation{Lat: 40.7, Lon: -74.0},
+	Proxy: &browserview.ProxyConfig{
+		Server: "http://proxy:8080", Username: "u", Password: "p",
+	},
+	ContextID:          "my-login", // cookies persist across runs under this id
+	Downloads:          true,       // persisted /downloads mount + file APIs
+	Metadata:           map[string]string{"job": "crawl-1"},
+	MaxLifetimeSeconds: 600,
+})
+```
+
+Overrides apply once the session is healthy — the very first `StartURL` navigation can go out with stock headers, so navigate over CDP from `about:blank` when the first request matters. The applied config (secrets redacted) is echoed on `session.Config`; labels on `session.Metadata`.
+
+```go
+sessions, err := client.ListSessionsByMetadata(ctx, map[string]string{"job": "crawl-1"})
+
+image, err := client.Screenshot(ctx, session.ID, browserview.ScreenshotOptions{Format: "png"})
+
+files, err := client.ListDownloads(ctx, session.ID)               // works after the session ends
+data, err := client.DownloadFile(ctx, session.ID, files[0].Name)
+result, err := client.UploadFile(ctx, session.ID, "input.csv", csvBytes)
+
+token, err := client.SolveCaptcha(ctx, session.ID, browserview.SolveCaptchaOptions{
+	Type: browserview.CaptchaTurnstile, Sitekey: "0x...", URL: "https://target.example",
+}) // 501 APIError unless the host has a solver
+```
+
 ## Session replay
 
 Create the session with `Record: true` and BrowserView captures everything server-side — a video of the display plus structured streams of actions, console output, network requests, and errors:
@@ -108,16 +146,16 @@ session, err := client.CreateSession(ctx, browserview.CreateSessionOptions{
 // ... drive the session ...
 _ = client.DestroySession(ctx, session.ID)
 
-// Ready seconds after the session ends; bound the wait with a context.
-waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-defer cancel()
-replay, err := client.WaitForReplay(waitCtx, session.ID, 0) // 0 = 5s poll interval
+// Ready seconds after the session ends. Without a context deadline the wait
+// is bounded at 2 minutes (DefaultReplayWait); a caller-supplied deadline is
+// respected as-is.
+replay, err := client.WaitForReplay(ctx, session.ID, 0) // 0 = 5s poll interval
 fmt.Println(replay.Video.URL)              // seekable WebM
 fmt.Println(replay.Pages)                  // main-frame navigation timeline
 fmt.Println(replay.Events["console"].URL)  // JSONL: {"ts": ..., "level": ...}
 ```
 
-`GetReplay` fetches the manifest without polling: it returns `Status: "recording"` while the session is alive and a 404 `APIError` while the recording finalizes. Every event line carries an absolute epoch-ms `ts`; align it with the video via `(ts - replay.Video.StartTimeMs) / 1000` seconds. Artifact URLs expire at `URLsExpireAtMs` — call `GetReplay` again for fresh ones.
+`GetReplay` fetches the manifest without polling: it returns `Status: "recording"` while the session is alive and a 404 `APIError` while the recording finalizes. If the live session was created without `Record: true`, `WaitForReplay` fails immediately instead of polling. Every event line carries an absolute epoch-ms `ts`; align it with the video via `(ts - replay.Video.StartTimeMs) / 1000` seconds. Artifact URLs expire at `URLsExpireAtMs` — call `GetReplay` again for fresh ones. `replay.Video.Segments` maps each raw recording segment (several after a mid-session agent restart) into the merged video.
 
 ## Errors and retries
 
@@ -135,11 +173,13 @@ Status codes you will see:
 
 - `401` — invalid or missing key (repeated failures escalate to per-IP 429).
 - `404` — unknown session, or one your key cannot see.
-- `429` + `Retry-After: 30` — session/capacity limits (create) or rate limits.
+- `429` + `Retry-After: 30` — session/capacity limits on create (session limits, memory, ports).
+- `429` + `Retry-After: 60` — request/create rate limits (per IP or per owner) and repeated auth failures.
 - `502` — session create/backend failure.
 - `503` + `Retry-After: 10` — auth temporarily unavailable; retryable.
+- `503` + `Retry-After: 60` — recording backend unavailable (create with `Record: true`).
 
-The client retries automatically: `429` and `503` responses are retried for every method (a `429`/`503` on `POST /sessions` means the session was **not** created, so the retry is safe), and transport errors are retried for idempotent GET/DELETE. Waits honor `Retry-After` (capped at 30s per wait), otherwise back off 1s/2s/4s. Default 3 retries; configure with `WithMaxRetries` (0 disables). Sleeps respect context cancellation. The default per-request timeout is 60s (`WithTimeout` to change), sized for create-with-wait.
+The client retries automatically: `429` and `503` responses are retried for every method (a `429`/`503` on `POST /sessions` means the session was **not** created, so the retry is safe), and transport errors are retried for idempotent GET/DELETE. Waits honor `Retry-After` (capped at 30s per wait), otherwise back off 1s/2s/4s. Default 3 retries; configure with `WithMaxRetries` (0 disables). Sleeps respect context cancellation. The default per-request timeout is 90s (`WithTimeout` to change), sized for create-with-wait (which can block up to ~60s server-side).
 
 ## Health checks
 
